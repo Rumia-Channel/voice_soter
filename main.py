@@ -2,20 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 音声ファイル分類補助ソフト（PySide6）
-プロジェクト対応／複数入力／有効/無効／完了タグ／除外フォルダ（Del）／再帰探索／履歴保存
+プロジェクト対応／複数入力／有効/無効／完了タグ／再帰探索／除外（Del）／後回し（Shift+Space）／履歴保存
+
+ポイント:
 - 起動時に必ず「プロジェクト選択/新規作成」ダイアログ
 - 画面上部に「プロジェクトを選択…」ボタン（いつでも切替）
 - 永続化は **プロジェクト単位**：
     ~/.voice_sorter/projects/<project_key>/voice_sorter.sqlite3
   * tables: settings, names, history, inputs
-- 入力フォルダを複数登録し、有効/無効切替、完了タグ付与（done）
+- 入力フォルダを複数登録・有効/無効切替・完了タグ付与（done）
   * 無効 or 完了はスキャン対象外
 - 再帰探索 ON/OFF
-- Del で「処理中のフォルダ」直下に _excluded_by_voice_sorter を作成して移動（以後対象外）
-  * **移動前に QMediaPlayer を必ずアンロード（stop→setSource(空)→processEvents）**
-  * Windows のロック対策として短いリトライあり
-- Space は再生/一時停止、Ctrl+Space は入力欄に空白を挿入
-- Enter で出力/<キャラ名（空白→_）>/ に移動（重複は (1),(2)…）
+- **Del**: 「処理中のフォルダ」直下に `_excluded_by_voice_sorter` へ移動（以後対象外）
+- **Shift+Space**: 「処理中のフォルダ」直下に `_deferred_by_voice_sorter` へ移動（いったん後回し）
+  * 通常の音声がすべて無くなった時点で、これらを**自動で元の親フォルダへ戻し**、再度処理を続行
+- **Space** は常に再生/一時停止だけに使用（他の動作はしない）。**Ctrl+Space** は入力欄に空白を挿入
+- キャラ名オートコンプリート: 一意確定で即補完＆以降の入力をロック（Backspace/Delete で解除）
+- 移動・除外・後回しの前に **QMediaPlayer をアンロード（stop→setSource(空)→processEvents）**
+  + Windows のロック対策で短いリトライあり
 
 依存:
   pip install PySide6
@@ -44,6 +48,7 @@ APP_DIR_NAME = ".voice_sorter"
 PROJECTS_DIR = "projects"
 DB_NAME = "voice_sorter.sqlite3"
 EXCLUDE_DIR_NAME = "_excluded_by_voice_sorter"
+DEFER_DIR_NAME = "_deferred_by_voice_sorter"
 
 # ---------- utils ----------
 def app_data_dir() -> Path:
@@ -54,7 +59,7 @@ def app_data_dir() -> Path:
 def safe_key(name: str) -> str:
     s = re.sub(r"\s+", "_", (name or "").strip())
     s = s.strip("._") or "Unnamed"
-    return re.sub(r'[\\/:*?"<>|]', "_", s)
+    return re.sub(r"[\\/:*?\"<>|]", "_", s)
 
 # ---------- per-project store ----------
 class Store:
@@ -66,15 +71,35 @@ class Store:
 
     def _init_schema(self):
         c = self.conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS settings(
-          key TEXT PRIMARY KEY, value TEXT);""")
-        c.execute("""CREATE TABLE IF NOT EXISTS names(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE);""")
-        c.execute("""CREATE TABLE IF NOT EXISTS history(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL, action TEXT NOT NULL, payload TEXT);""")
-        c.execute("""CREATE TABLE IF NOT EXISTS inputs(
-          path TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, done INTEGER NOT NULL DEFAULT 0);""")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings(
+              key TEXT PRIMARY KEY, value TEXT
+            );
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS names(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE
+            );
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL, action TEXT NOT NULL, payload TEXT
+            );
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inputs(
+              path TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, done INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
         self.conn.commit()
 
     # settings
@@ -84,8 +109,13 @@ class Store:
 
     def set_setting(self, key: str, value: str):
         c = self.conn.cursor()
-        c.execute("""INSERT INTO settings(key,value) VALUES(?,?)
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, value))
+        c.execute(
+            """
+            INSERT INTO settings(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
         self.conn.commit(); self.log("set_setting", {"key": key, "value": value})
 
     # names
@@ -106,9 +136,13 @@ class Store:
 
     def upsert_input(self, path: Path, enabled: bool=True, done: bool=False):
         c = self.conn.cursor()
-        c.execute("""INSERT INTO inputs(path,enabled,done) VALUES(?,?,?)
-                     ON CONFLICT(path) DO UPDATE SET enabled=excluded.enabled, done=excluded.done""",
-                  (str(path), 1 if enabled else 0, 1 if done else 0))
+        c.execute(
+            """
+            INSERT INTO inputs(path,enabled,done) VALUES(?,?,?)
+            ON CONFLICT(path) DO UPDATE SET enabled=excluded.enabled, done=excluded.done
+            """,
+            (str(path), 1 if enabled else 0, 1 if done else 0),
+        )
         self.conn.commit(); self.log("upsert_input", {"path": str(path), "enabled": enabled, "done": done})
 
     def set_enabled(self, path: Path, enabled: bool):
@@ -126,8 +160,10 @@ class Store:
     # history
     def log(self, action: str, payload: dict):
         ts = datetime.now().isoformat(timespec="seconds")
-        self.conn.execute("INSERT INTO history(ts,action,payload) VALUES(?,?,?)",
-                          (ts, action, json.dumps(payload, ensure_ascii=False)))
+        self.conn.execute(
+            "INSERT INTO history(ts,action,payload) VALUES(?,?,?)",
+            (ts, action, json.dumps(payload, ensure_ascii=False)),
+        )
         self.conn.commit()
 
 # ---------- dialogs ----------
@@ -136,7 +172,8 @@ class NamesEditor(QDialog):
         super().__init__(parent)
         self.setWindowTitle("キャラクター名を編集")
         self.setMinimumSize(480, 360)
-        self.text = QTextEdit(self); self.text.setPlaceholderText("1行に1つ、またはカンマ区切りで入力")
+        self.text = QTextEdit(self)
+        self.text.setPlaceholderText("1行に1つ、またはカンマ区切りで入力\n例)\nArlan\nAsta\nDan Heng")
         self.text.setText("\n".join(names))
         lay = QVBoxLayout(self)
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -146,7 +183,7 @@ class NamesEditor(QDialog):
     def get_names(self) -> List[str]:
         raw = self.text.toPlainText(); parts: List[str] = []
         for line in raw.splitlines():
-            if "," in line: parts += [p.strip() for p in line.split(",")]
+            if "," in line: parts.extend(p.strip() for p in line.split(","))
             else: parts.append(line.strip())
         seen=set(); out: List[str]=[]
         for p in parts:
@@ -189,7 +226,7 @@ class VoiceSorter(QMainWindow):
         self.projects_dir = self.base_dir / PROJECTS_DIR
         self.qsettings = QSettings(ORG_NAME, APP_NAME)
 
-        # 必ずプロジェクト選択
+        # 起動時に必ずプロジェクト選択
         self.project_key = self.ensure_project(force_prompt=True)
         self.project_dir = self.projects_dir / self.project_key
         self.store = Store(self.project_dir / DB_NAME)
@@ -202,6 +239,8 @@ class VoiceSorter(QMainWindow):
         if self.output_dir and not self.output_dir.exists(): self.output_dir = None
         self.names = self.store.get_names()
         self.files: List[Path] = []; self.index = -1
+        self.name_locked: bool = False  # 一意確定後のロック
+        self.restored_deferred_once: bool = False  # 無限復帰ループ防止
 
         # ---- UI ----
         central = QWidget(); self.setCentralWidget(central); root = QVBoxLayout(central)
@@ -221,8 +260,7 @@ class VoiceSorter(QMainWindow):
         col_left = QVBoxLayout(); row.addLayout(col_left, 3)
         col_right = QVBoxLayout(); row.addLayout(col_right, 1)
 
-        self.list_inputs = QListWidget()
-        self.list_inputs.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list_inputs = QListWidget(); self.list_inputs.setSelectionMode(QListWidget.ExtendedSelection)
         col_left.addWidget(QLabel("入力フォルダ（チェック=有効 / グレー=完了は対象外）"))
         col_left.addWidget(self.list_inputs)
         self.btn_add_in = QPushButton("追加…")
@@ -245,7 +283,7 @@ class VoiceSorter(QMainWindow):
 
         # name input + completer (+ space handling)
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("キャラクター名（Space:再生 / Ctrl+Space:空白 / Enter:振り分け / Del:除外）")
+        self.name_edit.setPlaceholderText("キャラクター名（Space:再生 / Ctrl+Space:空白 / Enter:振り分け / Del:除外 / Shift+Space:後回し）")
         root.addWidget(self.name_edit)
         self.model = QStringListModel(self.names)
         self.completer = QCompleter(self.model, self)
@@ -255,6 +293,8 @@ class VoiceSorter(QMainWindow):
         self.name_edit.setCompleter(self.completer)
         self.name_edit.textChanged.connect(self.on_name_changed)
         self.name_edit.installEventFilter(self)
+        try: self.completer.popup().installEventFilter(self)
+        except Exception: pass
 
         # player (guard)
         self.player = None
@@ -319,6 +359,17 @@ class VoiceSorter(QMainWindow):
         self.qsettings.setValue("last_project", key); return key
 
     @Slot()
+    def edit_names(self):
+        dlg = NamesEditor(self.names, self)
+        if dlg.exec() == QDialog.Accepted:
+            new_names = dlg.get_names()
+            self.names = new_names
+            self.settings.setValue("names", self.names)
+            self.update_completer()
+            self.history.log("edit_names", {"names": self.names})
+        self.ensure_focus()
+
+    @Slot()
     def change_project(self):
         key = self.ensure_project(force_prompt=True)
         if key == self.project_key: return
@@ -331,20 +382,28 @@ class VoiceSorter(QMainWindow):
         if self.output_dir and not self.output_dir.exists(): self.output_dir = None
         self.names = self.store.get_names(); self.update_completer()
         self.btn_project.setText(f"プロジェクトを選択…（現在: {self.project_key}）")
+        self.restored_deferred_once = False
         self.refresh_inputs_view(); self.load_files(); self.ensure_focus()
 
     # ---------- inputs CRUD ----------
     def refresh_inputs_view(self):
         self.list_inputs.clear()
+        # 再接続のためのガード
+        try:
+            self.list_inputs.itemChanged.disconnect()
+        except Exception:
+            pass
         for path, enabled, done in self.store.list_inputs():
             it = QListWidgetItem(path)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             it.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
             if done: it.setForeground(Qt.gray)
             self.list_inputs.addItem(it)
+        try:
+            self.list_inputs.itemChanged.connect(self._on_input_item_changed)
+        except Exception:
+            pass
         self.update_status()
-        # クリックで有効/無効トグル
-        self.list_inputs.itemChanged.connect(self._on_input_item_changed)
 
     def _on_input_item_changed(self, item: QListWidgetItem):
         p = Path(item.text()); enabled = (item.checkState() == Qt.Checked)
@@ -391,24 +450,14 @@ class VoiceSorter(QMainWindow):
             self.store.log("choose_output", {"dir": str(self.output_dir)})
             self.update_status(); self.ensure_focus()
 
-    # ---------- names ----------
-    @Slot()
-    def edit_names(self):
-        dlg = NamesEditor(self.names, self)
-        if dlg.exec() == QDialog.Accepted:
-            self.names = dlg.get_names(); self.store.set_names(self.names)
-            self.update_completer()
-        self.ensure_focus()
-
     # ---------- player handle helpers ----------
     def _unload_player_current(self):
-        """移動前に必ず呼ぶ: stop -> clear source -> processEvents で OS ハンドル解放"""
         try:
             if self.player: self.player.stop()
         except Exception:
             pass
         try:
-            if self.player: self.player.setSource(QUrl())  # 空URLで解除
+            if self.player: self.player.setSource(QUrl())
         except Exception:
             pass
         QApplication.processEvents()
@@ -420,8 +469,7 @@ class VoiceSorter(QMainWindow):
                 shutil.move(str(src), str(dest))
                 return True, None
             except Exception as e:
-                last_err = e
-                time.sleep(wait_sec)
+                last_err = e; time.sleep(wait_sec)
         return False, last_err
 
     # ---------- scanning ----------
@@ -431,18 +479,22 @@ class VoiceSorter(QMainWindow):
 
         def add_from_dir(d: Path):
             if not d.exists(): return
-            if d.name == EXCLUDE_DIR_NAME: return
+            if d.name in (EXCLUDE_DIR_NAME, DEFER_DIR_NAME): return
             if self.recursive:
                 for p in sorted(d.rglob("*")):
-                    if p.is_dir() and p.name == EXCLUDE_DIR_NAME: continue
-                    if p.is_file() and p.suffix.lower() in AUDIO_EXTS: files.append(p)
+                    if p.is_dir() and p.name in (EXCLUDE_DIR_NAME, DEFER_DIR_NAME):
+                        continue
+                    if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                        files.append(p)
             else:
                 for p in sorted(d.iterdir()):
-                    if p.is_dir() and p.name == EXCLUDE_DIR_NAME: continue
-                    if p.is_file() and p.suffix.lower() in AUDIO_EXTS: files.append(p)
+                    if p.is_dir() and p.name in (EXCLUDE_DIR_NAME, DEFER_DIR_NAME):
+                        continue
+                    if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                        files.append(p)
 
         for d, enabled, done in inputs:
-            if enabled and not done: add_from_dir(d)
+            if enabled and not done: add_from_dir(Path(d))
 
         # de-dup
         seen=set(); uniq=[]
@@ -451,7 +503,42 @@ class VoiceSorter(QMainWindow):
             if sp not in seen: seen.add(sp); uniq.append(p)
         self.files = uniq; self.index = 0 if self.files else -1
         self.update_status(); self.store.log("load_files", {"count": len(self.files)})
+
+        if not self.files:
+            # 通常ファイルがなく、後回しが残っていれば元に戻してもう一度ロード
+            if self.restore_deferred_if_any():
+                self.restored_deferred_once = True
+                return self.load_files()
         self.show_current_file()
+
+    def restore_deferred_if_any(self) -> bool:
+        """各入力フォルダ配下の _deferred_by_voice_sorter の中身を親フォルダへ戻す。
+        戻した場合 True を返す。"""
+        restored = False
+        for path, enabled, done in self.store.list_inputs():
+            if not enabled or done: continue
+            base = Path(path)
+            if not base.exists(): continue
+            # 再帰でも非再帰でも、とりあえず全ての DEFER_DIR_NAME を探す
+            for d in base.rglob(DEFER_DIR_NAME) if self.recursive else [base / DEFER_DIR_NAME]:
+                if not d.exists() or not d.is_dir(): continue
+                for f in sorted(d.iterdir()):
+                    if f.is_file():
+                        dest = d.parent / f.name
+                        if dest.exists():
+                            stem, suf = dest.stem, dest.suffix; i = 1
+                            while True:
+                                cand = d.parent / f"{stem} ({i}){suf}"
+                                if not cand.exists(): dest = cand; break
+                                i += 1
+                        ok, err = self._try_move_with_retry(f, dest)
+                        if ok:
+                            restored = True
+                            self.store.log("restore_deferred", {"src": str(f), "dst": str(dest)})
+                        else:
+                            self.store.log("restore_deferred_error", {"src": str(f), "error": str(err)})
+                # 空になった defer フォルダは残しても問題ないのでそのまま
+        return restored
 
     # ---------- playback ----------
     @Slot()
@@ -465,7 +552,7 @@ class VoiceSorter(QMainWindow):
             self.player.play(); self.store.log("play", {"file": self.player.source().toString()})
         self.ensure_focus()
 
-    # ---------- classify / exclude ----------
+    # ---------- classify / exclude / defer ----------
     def _safe_folder_name(self, name: str) -> str:
         return safe_key(name)
 
@@ -489,7 +576,6 @@ class VoiceSorter(QMainWindow):
                 if not cand.exists(): dest=cand; break
                 i+=1
 
-        # アンロードしてから移動（Windows のロック対策）
         self._unload_player_current()
         ok, err = self._try_move_with_retry(src, dest)
         if not ok:
@@ -500,17 +586,19 @@ class VoiceSorter(QMainWindow):
 
         del self.files[self.index]
         if self.index >= len(self.files): self.index = len(self.files) - 1
-        self.name_edit.clear(); self.update_status(); self.show_current_file(); self.ensure_focus()
+        self.name_locked = False
+        self.name_edit.clear(); self.update_status();
+        if self.index < 0 and not self.files:
+            if self.restore_deferred_if_any():
+                return self.load_files()
+        self.show_current_file(); self.ensure_focus()
 
     @Slot()
     def exclude_current(self):
         if not (0 <= self.index < len(self.files)): self.ensure_focus(); return
         src = self.files[self.index]
         excl_dir = src.parent / EXCLUDE_DIR_NAME
-        try:
-            excl_dir.mkdir(exist_ok=True)
-        except Exception:
-            pass
+        excl_dir.mkdir(exist_ok=True)
         dest = excl_dir / src.name
         if dest.exists():
             stem,suf = dest.stem,dest.suffix; i=1
@@ -518,24 +606,52 @@ class VoiceSorter(QMainWindow):
                 cand = excl_dir / f"{stem} ({i}){suf}"
                 if not cand.exists(): dest=cand; break
                 i+=1
-
         self._unload_player_current()
         ok, err = self._try_move_with_retry(src, dest)
         if not ok:
             QMessageBox.critical(self, "除外エラー", f"ファイルを除外できませんでした:\n{err}")
             self.store.log("exclude_error", {"src": str(src), "error": str(err)}); self.ensure_focus(); return
-
         self.store.log("exclude", {"src": str(src), "dst": str(dest)})
-
         del self.files[self.index]
         if self.index >= len(self.files): self.index = len(self.files) - 1
-        self.update_status(); self.show_current_file(); self.ensure_focus()
+        self.update_status();
+        if self.index < 0 and not self.files:
+            if self.restore_deferred_if_any():
+                return self.load_files()
+        self.show_current_file(); self.ensure_focus()
+
+    def defer_current(self):
+        """Shift+Space: 後回し。処理中フォルダ直下の DEFER_DIR_NAME へ移動"""
+        if not (0 <= self.index < len(self.files)): self.ensure_focus(); return
+        src = self.files[self.index]
+        dfr_dir = src.parent / DEFER_DIR_NAME
+        dfr_dir.mkdir(exist_ok=True)
+        dest = dfr_dir / src.name
+        if dest.exists():
+            stem,suf = dest.stem,dest.suffix; i=1
+            while True:
+                cand = dfr_dir / f"{stem} ({i}){suf}"
+                if not cand.exists(): dest=cand; break
+                i+=1
+        self._unload_player_current()
+        ok, err = self._try_move_with_retry(src, dest)
+        if not ok:
+            QMessageBox.critical(self, "後回しエラー", f"ファイルを後回しにできませんでした:\n{err}")
+            self.store.log("defer_error", {"src": str(src), "error": str(err)}); self.ensure_focus(); return
+        self.store.log("defer", {"src": str(src), "dst": str(dest)})
+        del self.files[self.index]
+        if self.index >= len(self.files): self.index = len(self.files) - 1
+        self.update_status();
+        if self.index < 0 and not self.files:
+            if self.restore_deferred_if_any():
+                return self.load_files()
+        self.show_current_file(); self.ensure_focus()
 
     # ---------- display ----------
     def show_current_file(self):
         if 0 <= self.index < len(self.files):
             f = self.files[self.index]
-            self.lbl_file.setText(f"現在: " + f.name)
+            self.lbl_file.setText("現在: " + f.name)
             try:
                 if self.player:
                     self.player.stop(); self.player.setSource(QUrl.fromLocalFile(str(f)))
@@ -545,33 +661,51 @@ class VoiceSorter(QMainWindow):
         else:
             self.lbl_file.setText("完了！ファイルはありません。")
             try:
-                if self.player: self.player.stop(); self.player.setSource(QUrl())  # 念のため解除
+                if self.player: self.player.stop(); self.player.setSource(QUrl())
             except Exception:
                 pass
             self.store.log("show_file_none", {})
 
     # ---------- keyboard / autocomplete ----------
     def eventFilter(self, obj, event):
-        if obj is self.name_edit and event.type() == QEvent.KeyPress:
+        if event.type() == QEvent.KeyPress:
+            # Space 系はグローバルに捕捉: Space→再生, Ctrl+Space→空白, Shift+Space→後回し
             if event.key() == Qt.Key_Space:
                 if event.modifiers() == Qt.ControlModifier:
-                    self.name_edit.insert(" "); return True
-                else:
+                    if obj is self.name_edit:
+                        self.name_edit.insert(" ")
+                    return True
+                if event.modifiers() == Qt.ShiftModifier:
+                    self.defer_current(); return True
+                if event.modifiers() == Qt.NoModifier:
                     self.toggle_play(); return True
-            if event.key() == Qt.Key_Delete and event.modifiers() == Qt.NoModifier:
-                self.exclude_current(); return True
+            if obj is self.name_edit:
+                # 確定ロック中は一部以外の入力をブロック
+                if self.name_locked:
+                    allowed = {Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Return, Qt.Key_Enter,
+                               Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End,
+                               Qt.Key_Tab, Qt.Key_Backtab}
+                    if event.key() not in allowed:
+                        return True
+                    if event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
+                        self.name_locked = False
         return super().eventFilter(obj, event)
 
     @Slot(str)
     def on_name_changed(self, text: str):
         t = (text or "").strip()
-        if not t: return
+        if not t:
+            self.name_locked = False
+            return
+        if self.name_locked:
+            return
         matches = [n for n in self.names if t.lower() in n.lower()]
         if len(matches) == 1:
             m = matches[0]
             if m.lower().startswith(t.lower()) and m != text:
                 self.name_edit.blockSignals(True); self.name_edit.setText(m); self.name_edit.blockSignals(False)
                 self.name_edit.setCursorPosition(len(m))
+                self.name_locked = True
         self.ensure_focus()
 
 # ---------- entry ----------
