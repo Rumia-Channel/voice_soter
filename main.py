@@ -285,6 +285,7 @@ class VoiceSorter(QMainWindow):
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("キャラクター名（Space:再生 / Ctrl+Space:空白 / Enter:振り分け / Del:除外 / Shift+Space:後回し）")
         root.addWidget(self.name_edit)
+        self.name_edit.setReadOnly(False)
         self.model = QStringListModel(self.names)
         self.completer = QCompleter(self.model, self)
         self.completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -364,9 +365,10 @@ class VoiceSorter(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             new_names = dlg.get_names()
             self.names = new_names
-            self.settings.setValue("names", self.names)
+            # プロジェクトDBへ保存し、補完を更新
+            self.store.set_names(self.names)
             self.update_completer()
-            self.history.log("edit_names", {"names": self.names})
+            self.store.log("edit_names", {"names": self.names})
         self.ensure_focus()
 
     @Slot()
@@ -558,6 +560,12 @@ class VoiceSorter(QMainWindow):
 
     @Slot()
     def confirm_and_move(self):
+         # Enter 実行時に補完ポップアップが残らないよう明示的に閉じる
+        try:
+            if self.completer and self.completer.popup().isVisible():
+                self.completer.popup().hide()
+        except Exception:
+            pass
         name = self.name_edit.text().strip()
         if not name:
             QMessageBox.warning(self, "未入力", "キャラクター名を入力してください。"); self.store.log("move_failed", {"reason":"empty_name"}); self.ensure_focus(); return
@@ -587,6 +595,7 @@ class VoiceSorter(QMainWindow):
         del self.files[self.index]
         if self.index >= len(self.files): self.index = len(self.files) - 1
         self.name_locked = False
+        self.name_edit.setReadOnly(False)
         self.name_edit.clear(); self.update_status();
         if self.index < 0 and not self.files:
             if self.restore_deferred_if_any():
@@ -668,6 +677,14 @@ class VoiceSorter(QMainWindow):
 
     # ---------- keyboard / autocomplete ----------
     def eventFilter(self, obj, event):
+        # --- グローバル: Del は常に「除外」動作（かつロック解除） ---
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete and event.modifiers() == Qt.NoModifier:
+            self.name_locked = False  # 仕様どおり Delete で解除。ただし挙動は「除外」が優先
+            try: self.name_edit.setReadOnly(False)
+            except Exception: pass
+            self.exclude_current()
+            return True
+
         if event.type() == QEvent.KeyPress:
             # Space 系はグローバルに捕捉: Space→再生, Ctrl+Space→空白, Shift+Space→後回し
             if event.key() == Qt.Key_Space:
@@ -682,13 +699,53 @@ class VoiceSorter(QMainWindow):
             if obj is self.name_edit:
                 # 確定ロック中は一部以外の入力をブロック
                 if self.name_locked:
-                    allowed = {Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Return, Qt.Key_Enter,
+                    allowed = {Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Enter,
                                Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End,
                                Qt.Key_Tab, Qt.Key_Backtab}
+                    # Ctrl+V / Shift+Insert（貼り付け）も禁止
+                    if (event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_V) or \
+                       (event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_Insert):
+                        return True
                     if event.key() not in allowed:
                         return True
-                    if event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
-                        self.name_locked = False
+                    # Backspace でロック解除（Delete はグローバル除外を既に処理済み）
+                    # 1) ロック解除＆編集可能化
+                    self.name_locked = False
+                    try:
+                        self.name_edit.setReadOnly(False)
+                        self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
+                    except Exception:
+                        pass
+                    # 2) 読み取り専用だと元のイベントは効かないので、ここで手動削除してイベントを消費
+                    txt = self.name_edit.text()
+                    start = self.name_edit.selectionStart()
+                    if start != -1:
+                        # 選択範囲を削除
+                        sel = self.name_edit.selectedText()
+                        new_txt = txt[:start] + txt[start + len(sel):]
+                        self.name_edit.blockSignals(True)
+                        self.name_edit.setText(new_txt)
+                        self.name_edit.blockSignals(False)
+                        self.name_edit.setCursorPosition(start)
+                    else:
+                        # カーソル直前の1文字を削除
+                        cur = self.name_edit.cursorPosition()
+                        if cur > 0:
+                            new_txt = txt[:cur-1] + txt[cur:]
+                            self.name_edit.blockSignals(True)
+                            self.name_edit.setText(new_txt)
+                            self.name_edit.blockSignals(False)
+                            self.name_edit.setCursorPosition(cur-1)
+                    return True  # ここで完結する
+        # IME からの確定（かな入力など）をロック中は無効化
+        if obj is self.name_edit and self.name_locked and event.type() == QEvent.InputMethod:
+            return True
+        # ドロップによる貼り付け防止（ロック中）
+        if obj is self.name_edit and self.name_locked and event.type() in (QEvent.DragEnter, QEvent.Drop):
+            return True
+        # 右クリックメニュー自体は on_name_changed で無効化しているが、保険で ContextMenu もブロック
+        if obj is self.name_edit and self.name_locked and event.type() == QEvent.ContextMenu:
+            return True
         return super().eventFilter(obj, event)
 
     @Slot(str)
@@ -696,16 +753,36 @@ class VoiceSorter(QMainWindow):
         t = (text or "").strip()
         if not t:
             self.name_locked = False
+            try: self.name_edit.setReadOnly(False)
+            except Exception: pass
+            try: self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
+            except Exception: pass
             return
         if self.name_locked:
             return
         matches = [n for n in self.names if t.lower() in n.lower()]
         if len(matches) == 1:
             m = matches[0]
-            if m.lower().startswith(t.lower()) and m != text:
-                self.name_edit.blockSignals(True); self.name_edit.setText(m); self.name_edit.blockSignals(False)
-                self.name_edit.setCursorPosition(len(m))
+            if m.lower().startswith(t.lower()):
+                # まだ完全一致でないなら確定文字列に合わせる
+                if m != text:
+                    self.name_edit.blockSignals(True)
+                    self.name_edit.setText(m)
+                    self.name_edit.blockSignals(False)
+                    self.name_edit.setCursorPosition(len(m))
+                # 文字列が同じでも「ユニークに確定」したのでロックを必ず掛ける
                 self.name_locked = True
+                # 候補ポップアップを消す
+                try:
+                    if self.completer and self.completer.popup().isVisible():
+                        self.completer.popup().hide()
+                except Exception:
+                    pass
+                # ロック中は右クリック貼り付け禁止 + 入力を不可
+                try: self.name_edit.setContextMenuPolicy(Qt.NoContextMenu)
+                except Exception: pass
+                try: self.name_edit.setReadOnly(True)
+                except Exception: pass
         self.ensure_focus()
 
 # ---------- entry ----------
