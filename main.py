@@ -240,6 +240,7 @@ class VoiceSorter(QMainWindow):
         self.names = self.store.get_names()
         self.files: List[Path] = []; self.index = -1
         self.name_locked: bool = False  # 一意確定後のロック
+        self.prev_name_text: str = ""   # 直前の入力値（削除検知用）
         self.restored_deferred_once: bool = False  # 無限復帰ループ防止
 
         # ---- UI ----
@@ -596,7 +597,9 @@ class VoiceSorter(QMainWindow):
         if self.index >= len(self.files): self.index = len(self.files) - 1
         self.name_locked = False
         self.name_edit.setReadOnly(False)
-        self.name_edit.clear(); self.update_status();
+        self.name_edit.clear()
+        self.prev_name_text = ""  # 送出後にリセット
+        self.update_status();
         if self.index < 0 and not self.files:
             if self.restore_deferred_if_any():
                 return self.load_files()
