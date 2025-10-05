@@ -1,0 +1,10 @@
+[project]
+name = "voice-soter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "nuitka>=2.7.16",
+    "pyside6>=6.9.3",
+]
