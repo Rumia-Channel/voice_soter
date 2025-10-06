@@ -241,6 +241,7 @@ class VoiceSorter(QMainWindow):
         self.files: List[Path] = []; self.index = -1
         self.name_locked: bool = False  # 一意確定後のロック
         self.prev_name_text: str = ""   # 直前の入力値（削除検知用）
+        self.is_deleting: bool = False  # Backspace中は補完を停止
         self.restored_deferred_once: bool = False  # 無限復帰ループ防止
 
         # ---- UI ----
@@ -711,35 +712,43 @@ class VoiceSorter(QMainWindow):
                         return True
                     if event.key() not in allowed:
                         return True
-                    # Backspace でロック解除（Delete はグローバル除外を既に処理済み）
-                    # 1) ロック解除＆編集可能化
-                    self.name_locked = False
-                    try:
-                        self.name_edit.setReadOnly(False)
-                        self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
-                    except Exception:
-                        pass
-                    # 2) 読み取り専用だと元のイベントは効かないので、ここで手動削除してイベントを消費
-                    txt = self.name_edit.text()
-                    start = self.name_edit.selectionStart()
-                    if start != -1:
-                        # 選択範囲を削除
-                        sel = self.name_edit.selectedText()
-                        new_txt = txt[:start] + txt[start + len(sel):]
-                        self.name_edit.blockSignals(True)
-                        self.name_edit.setText(new_txt)
-                        self.name_edit.blockSignals(False)
-                        self.name_edit.setCursorPosition(start)
-                    else:
-                        # カーソル直前の1文字を削除
-                        cur = self.name_edit.cursorPosition()
-                        if cur > 0:
-                            new_txt = txt[:cur-1] + txt[cur:]
+                    # Backspace のときだけ手動削除を行う（他の許可キーは通す）
+                    if event.key() == Qt.Key_Backspace:
+                        # 1) ロック解除＆編集可能化
+                        self.name_locked = False
+                        self.is_deleting = True  # ← この間は補完を止める
+                        try:
+                            self.name_edit.setReadOnly(False)
+                            self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
+                        except Exception:
+                            pass
+                        # 2) 読み取り専用だと元のイベントは効かないので、ここで手動削除してイベントを消費
+                        txt = self.name_edit.text()
+                        start = self.name_edit.selectionStart()
+                        if start != -1:
+                            sel = self.name_edit.selectedText()
+                            new_txt = txt[:start] + txt[start + len(sel):]
                             self.name_edit.blockSignals(True)
                             self.name_edit.setText(new_txt)
                             self.name_edit.blockSignals(False)
-                            self.name_edit.setCursorPosition(cur-1)
-                    return True  # ここで完結する
+                            self.name_edit.setCursorPosition(start)
+                            self.prev_name_text = new_txt  # ★ 即時同期
+                        else:
+                            cur = self.name_edit.cursorPosition()
+                            if cur > 0:
+                                new_txt = txt[:cur-1] + txt[cur:]
+                                self.name_edit.blockSignals(True)
+                                self.name_edit.setText(new_txt)
+                                self.name_edit.blockSignals(False)
+                                self.name_edit.setCursorPosition(cur-1)
+                                self.prev_name_text = new_txt  # ★ 即時同期
+                        # 候補ポップアップも隠す（揺り戻し防止）
+                        try:
+                            if self.completer and self.completer.popup().isVisible():
+                                self.completer.popup().hide()
+                        except Exception:
+                            pass
+                        return True  # ここで完結
         # IME からの確定（かな入力など）をロック中は無効化
         if obj is self.name_edit and self.name_locked and event.type() == QEvent.InputMethod:
             return True
@@ -754,8 +763,8 @@ class VoiceSorter(QMainWindow):
     @Slot(str)
     def on_name_changed(self, text: str):
         t = (text or "").strip()
-        # 直前より短くなっていれば「削除操作中」
-        is_deleting = len(t) < len(self.prev_name_text)
+        # 直前より短い or Backspace中フラグが立っている → 削除中
+        is_deleting = (len(t) < len(self.prev_name_text)) or self.is_deleting
         if not t:
             self.name_locked = False
             try: self.name_edit.setReadOnly(False)
@@ -768,9 +777,15 @@ class VoiceSorter(QMainWindow):
             # 既にロックされている時はここでは何もしない（Backspaceハンドラ側で解除）
             self.prev_name_text = t
             return
-        # 削除中はオートロックしない（途中で補完に巻き戻されるのを防止）
+        # 削除中はオートロック/補完をしない（揺り戻し防止）
         if is_deleting:
+            try:
+                if self.completer and self.completer.popup().isVisible():
+                    self.completer.popup().hide()
+            except Exception:
+                pass
             self.prev_name_text = t
+            self.is_deleting = False  # 1サイクルでクリア
             return
 
         matches = [n for n in self.names if t.lower() in n.lower()]
