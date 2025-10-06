@@ -754,15 +754,25 @@ class VoiceSorter(QMainWindow):
     @Slot(str)
     def on_name_changed(self, text: str):
         t = (text or "").strip()
+        # 直前より短くなっていれば「削除操作中」
+        is_deleting = len(t) < len(self.prev_name_text)
         if not t:
             self.name_locked = False
             try: self.name_edit.setReadOnly(False)
             except Exception: pass
             try: self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
             except Exception: pass
+            self.prev_name_text = t
             return
         if self.name_locked:
+            # 既にロックされている時はここでは何もしない（Backspaceハンドラ側で解除）
+            self.prev_name_text = t
             return
+        # 削除中はオートロックしない（途中で補完に巻き戻されるのを防止）
+        if is_deleting:
+            self.prev_name_text = t
+            return
+
         matches = [n for n in self.names if t.lower() in n.lower()]
         if len(matches) == 1:
             m = matches[0]
@@ -773,19 +783,20 @@ class VoiceSorter(QMainWindow):
                     self.name_edit.setText(m)
                     self.name_edit.blockSignals(False)
                     self.name_edit.setCursorPosition(len(m))
-                # 文字列が同じでも「ユニークに確定」したのでロックを必ず掛ける
+                # （追加入力での）ユニーク確定 → ロック
                 self.name_locked = True
-                # 候補ポップアップを消す
+                # 候補ポップアップを閉じる
                 try:
                     if self.completer and self.completer.popup().isVisible():
                         self.completer.popup().hide()
                 except Exception:
                     pass
-                # ロック中は右クリック貼り付け禁止 + 入力を不可
+                # ロック中は右クリック貼り付け禁止 + 入力不可
                 try: self.name_edit.setContextMenuPolicy(Qt.NoContextMenu)
                 except Exception: pass
                 try: self.name_edit.setReadOnly(True)
                 except Exception: pass
+        self.prev_name_text = t
         self.ensure_focus()
 
 # ---------- entry ----------
