@@ -541,7 +541,6 @@ class VoiceSorter(QMainWindow):
                             self.store.log("restore_deferred", {"src": str(f), "dst": str(dest)})
                         else:
                             self.store.log("restore_deferred_error", {"src": str(f), "error": str(err)})
-                # 空になった defer フォルダは残しても問題ないのでそのまま
         return restored
 
     # ---------- playback ----------
