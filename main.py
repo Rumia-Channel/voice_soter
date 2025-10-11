@@ -12,8 +12,8 @@
 - **Undo** は「キャラ名入力前（仕分け前）」に戻す：ファイルを元位置へ戻し、該当ファイルをカレント、入力欄は**シグナル停止で完全クリア**＆ロック解除。
 - **Redo** は「より分け済み」まで進める：再度仕分け先へ移動（採番で衝突回避）。入力欄は触らない。
 - Redo ショートカットは標準（Ctrl+Shift+Z / ⌘⇧Z）と Windows 流儀（Ctrl+Y）の両対応。
-- Enter 後に入力できない問題は QTimer による**遅延フォーカス**で解消。
-- ★本版では QLineEdit のテキストUndo/Redoを無効化し、Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y を eventFilter で先取りしてアプリの Undo/Redo を発火。
+- QLineEdit のテキストUndo/Redoを**無効化**し、Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y は **eventFilter で先取り**してアプリの Undo/Redo を発火。
+- ★ ロック（name_locked=True）時は IME 確定含む全入力をブロック。Backspace は**ロック解除しつつ**一文字削除が即時に効く。
 """
 
 from __future__ import annotations
@@ -317,7 +317,7 @@ class VoiceSorter(QMainWindow):
         self.names = self.store.get_names()
         self.files: List[Path] = []; self.index = -1
 
-        self.name_locked: bool = False
+        self.name_locked: bool = False         # 一意確定ロック
         self.prev_name_text: str = ""
         self.is_deleting: bool = False
 
@@ -372,7 +372,7 @@ class VoiceSorter(QMainWindow):
         root.addWidget(self.name_edit)
         self.name_edit.setReadOnly(False)
 
-        # ★ QLineEdit のテキストUndo/Redoを無効化（重要）
+        # QLineEdit のテキストUndo/Redoを無効化
         try:
             self.name_edit.setUndoRedoEnabled(False)
         except Exception:
@@ -439,19 +439,9 @@ class VoiceSorter(QMainWindow):
         return line
 
     def ensure_focus(self):
-        # 遅延フォーカスでレースに勝つ
-        def _focus():
-            try:
-                self.name_edit.setEnabled(True)
-                self.name_edit.setReadOnly(False)
-                self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
-                self.name_locked = False
-                self.is_deleting = False
-                self.name_edit.setFocus()
-                self.name_edit.setCursorPosition(len(self.name_edit.text()))
-            except Exception:
-                pass
-        QTimer.singleShot(0, _focus)
+        # フォーカスだけ当てる（ロック・ReadOnlyは一切いじらない）
+        QTimer.singleShot(0, lambda: (self.name_edit.setFocus(),
+                                      self.name_edit.setCursorPosition(len(self.name_edit.text()))))
 
     def update_completer(self):
         self.model.setStringList(self.names)
@@ -731,7 +721,7 @@ class VoiceSorter(QMainWindow):
         self._log_op("move", op_id, src, dest, "move")  # 内部用
         self.store.audit("move", src=str(src), dst=str(dest), character=name, folder=safe)  # 監査ログ
 
-        # 次のファイルへ進む前に UI 状態を完全リセット
+        # 次のファイルへ進む前に UI 状態を完全リセット（明示的に解除）
         del self.files[self.index]
         if self.index >= len(self.files):
             self.index = len(self.files) - 1
@@ -812,13 +802,6 @@ class VoiceSorter(QMainWindow):
 
     # ---------- persistent undo/redo helpers ----------
     def _build_op_state(self) -> Dict[str, Dict[str, Any]]:
-        """
-        history から op_id ごとの現在状態を再構築。
-        {op_id: {'last_event_id': int, 'type': 'move'|'exclude'|'defer',
-                 'origin_src': Path, 'origin_dst': Path,
-                 'state': 'applied'|'undone',
-                 'current_path': Path}}
-        """
         ops: Dict[str, Dict[str, Any]] = {}
         rows = self.store.fetch_history()
         for row in rows:
@@ -864,14 +847,14 @@ class VoiceSorter(QMainWindow):
             QMessageBox.information(self, "取り消しなし", "取り消せる操作がありません。")
             return
 
-        current = cand["current_path"]     # 今その操作が置いている場所（出力/除外/後回しフォルダ側）
+        current = cand["current_path"]
         origin_src = Path(cand["origin_src"])
         if not current.exists():
             QMessageBox.critical(self, "取り消しエラー", f"現在の位置にファイルが見つかりません:\n{current}")
             return
 
         self._unload_player_current()
-        target = self._finalize_dest(origin_src)  # 衝突回避しつつ元位置へ
+        target = self._finalize_dest(origin_src)
 
         ok, err = self._try_move_with_retry(current, target)
         if not ok:
@@ -879,14 +862,13 @@ class VoiceSorter(QMainWindow):
             self.store.log("undo_error", {"op_id": cand["op_id"], "error": str(err)})
             return
 
-        # 内部履歴に undo を記録（実パスを保存）
         self._log_op("undo", cand["op_id"], current, target, cand["type"])
 
         # 再スキャンして該当ファイルにジャンプ
         self.load_files()
         self._goto_file(target)
 
-        # 「キャラ名入力前」へ明示的に戻す（シグナル停止で揺り戻し防止）
+        # 「キャラ名入力前」に明示的に戻す
         self.name_locked = False
         self.is_deleting = False
         self.name_edit.blockSignals(True)
@@ -913,8 +895,8 @@ class VoiceSorter(QMainWindow):
             QMessageBox.information(self, "やり直しなし", "やり直せる操作がありません。")
             return
 
-        current = cand["current_path"]     # Undo 後の位置（入力側）
-        origin_dst = Path(cand["origin_dst"])  # 初回の目的地
+        current = cand["current_path"]
+        origin_dst = Path(cand["origin_dst"])
         if not current.exists():
             QMessageBox.critical(self, "やり直しエラー", f"現在の位置にファイルが見つかりません:\n{current}")
             return
@@ -928,24 +910,15 @@ class VoiceSorter(QMainWindow):
             self.store.log("redo_error", {"op_id": cand["op_id"], "error": str(err)})
             return
 
-        # 内部履歴に redo を記録（実パスを保存）
         self._log_op("redo", cand["op_id"], current, target, cand["type"])
 
-        # 再スキャンして該当ファイルにジャンプ（入力欄はいじらない＝「より分け済み」状態）
+        # 再スキャンして該当ファイルにジャンプ（入力欄はいじらない＝ロック維持のまま）
         self.load_files()
         self._goto_file(target)
 
     # ---------- display ----------
     def show_current_file(self):
-        # 保険: 表示切替時にロック・ReadOnlyを解除
-        self.name_locked = False
-        self.is_deleting = False
-        try:
-            self.name_edit.setReadOnly(False)
-            self.name_edit.setContextMenuPolicy(Qt.DefaultContextMenu)
-        except Exception:
-            pass
-
+        # ロックや ReadOnly には触れない（各操作で明示的に管理）
         if 0 <= self.index < len(self.files):
             f = self.files[self.index]
             self.lbl_file.setText("現在: " + f.name)
@@ -966,19 +939,15 @@ class VoiceSorter(QMainWindow):
 
     # ---------- keyboard / autocomplete ----------
     def eventFilter(self, obj, event):
-        # --- 追加: QLineEdit の Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y を先取りしてアプリの Undo/Redo ---
+        # QLineEdit の Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y は先取りしてアプリの Undo/Redo
         if obj is self.name_edit and event.type() == QEvent.KeyPress:
             mods = event.modifiers()
             key  = event.key()
-            # Ctrl+Z → Undo（Shift を伴わない）
             if key == Qt.Key_Z and (mods & Qt.ControlModifier) and not (mods & Qt.ShiftModifier):
-                self.undo_last_persistent()
-                return True  # QLineEdit には渡さない
-            # Ctrl+Shift+Z or Ctrl+Y → Redo
+                self.undo_last_persistent(); return True
             if (key == Qt.Key_Z and (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier)) or \
                (key == Qt.Key_Y and (mods & Qt.ControlModifier)):
-                self.redo_last_persistent()
-                return True  # QLineEdit には渡さない
+                self.redo_last_persistent(); return True
 
         # Del は常に「除外」
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete and event.modifiers() == Qt.NoModifier:
@@ -992,27 +961,16 @@ class VoiceSorter(QMainWindow):
             # Space 系: Space→再生, Ctrl+Space→空白, Shift+Space→後回し
             if event.key() == Qt.Key_Space:
                 if event.modifiers() == Qt.ControlModifier:
-                    if obj is self.name_edit: self.name_edit.insert(" ")
-                    return True
+                    if obj is self.name_edit: self.name_edit.insert(" "); return True
                 if event.modifiers() == Qt.ShiftModifier:
                     self.defer_current(); return True
                 if event.modifiers() == Qt.NoModifier:
                     self.toggle_play(); return True
 
             if obj is self.name_edit:
+                # ロック中は入力を一律ブロック（Backspace だけ特別扱い）
                 if self.name_locked:
-                    allowed = {
-                        Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Enter,
-                        Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End,
-                        Qt.Key_Tab, Qt.Key_Backtab
-                    }
-                    # 貼り付け禁止（ロック時）
-                    if (event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_V) or \
-                       (event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_Insert):
-                        return True
-                    if event.key() not in allowed:
-                        return True
-
+                    # Backspace は「ロック解除＋一文字削除」を即時実行
                     if event.key() == Qt.Key_Backspace:
                         self.name_locked = False
                         self.is_deleting = True
@@ -1039,13 +997,18 @@ class VoiceSorter(QMainWindow):
                         except Exception:
                             pass
                         return True
+                    # それ以外は消費（入力させない）
+                    return True
 
-                if obj is self.name_edit and self.name_locked and event.type() == QEvent.InputMethod:
-                    return True
-                if obj is self.name_edit and self.name_locked and event.type() in (QEvent.DragEnter, QEvent.Drop):
-                    return True
-                if obj is self.name_edit and self.name_locked and event.type() == QEvent.ContextMenu:
-                    return True
+                # ロックしていないときの貼り付けなどは通常通り
+
+        # IME の確定もロック中は無効化
+        if obj is self.name_edit and self.name_locked and event.type() == QEvent.InputMethod:
+            return True
+
+        # ドロップ/コンテキストメニューもロック中は無効化
+        if obj is self.name_edit and self.name_locked and event.type() in (QEvent.DragEnter, QEvent.Drop, QEvent.ContextMenu):
+            return True
 
         return super().eventFilter(obj, event)
 
@@ -1062,6 +1025,7 @@ class VoiceSorter(QMainWindow):
             except Exception: pass
             self.prev_name_text = t; return
 
+        # 既にロックされているときは（Backspace処理以外では）ここに来ない想定
         if self.name_locked:
             self.prev_name_text = t; return
 
@@ -1080,6 +1044,7 @@ class VoiceSorter(QMainWindow):
                 if m != text:
                     self.name_edit.blockSignals(True); self.name_edit.setText(m); self.name_edit.blockSignals(False)
                     self.name_edit.setCursorPosition(len(m))
+                # ここでロック
                 self.name_locked = True
                 try:
                     if self.completer and self.completer.popup().isVisible():
