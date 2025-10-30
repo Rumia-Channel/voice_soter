@@ -346,7 +346,7 @@ class VoiceSorter(QMainWindow):
         self.btn_add_in = QPushButton("追加…")
         self.btn_rm_in = QPushButton("選択削除")
         self.btn_done = QPushButton("選択に完了タグを付ける/外す")
-        self.chk_recursive = QCheckBox("再帰的に探索"); self.chk_recursive.setChecked(self.recursive)
+        self.chk_recursive = QCheckBox("再帰的に探索")
         for w in (self.btn_add_in, self.btn_rm_in, self.btn_done, self.chk_recursive):
             col_right.addWidget(w)
         col_right.addStretch(1)
@@ -360,8 +360,13 @@ class VoiceSorter(QMainWindow):
         root.addWidget(self._sep())
         self.lbl_status = QLabel("入力/出力フォルダを選択してください。")
         self.lbl_file = QLabel("-")
-        self.lbl_status.setStyleSheet("font-weight:600"); self.lbl_file.setStyleSheet("color:#555")
-        root.addWidget(self.lbl_status); root.addWidget(self.lbl_file)
+        self.lbl_playback_time = QLabel("再生時間: 0:00.00 / 0:00.00")
+        self.lbl_status.setStyleSheet("font-weight:600")
+        self.lbl_file.setStyleSheet("font-size:11pt")
+        self.lbl_playback_time.setStyleSheet("font-size:11pt; font-weight:600")
+        root.addWidget(self.lbl_status)
+        root.addWidget(self.lbl_file)
+        root.addWidget(self.lbl_playback_time)
 
         # name input + completer
         self.name_edit = QLineEdit()
@@ -397,6 +402,8 @@ class VoiceSorter(QMainWindow):
             self.audio = QAudioOutput(self)
             self.player = QMediaPlayer(self)
             self.player.setAudioOutput(self.audio)
+            self.player.positionChanged.connect(self.update_playback_time)
+            self.player.durationChanged.connect(self.update_playback_time)
         except Exception as e:
             self.store.log("player_init_failed", {"error": str(e)})
             self.player = None
@@ -429,6 +436,8 @@ class VoiceSorter(QMainWindow):
 
         # load
         self.refresh_inputs_view()
+        # チェックボックスの初期値を設定（全UIが作成された後）
+        self.chk_recursive.setChecked(self.recursive)
         if self.output_dir:
             self.load_files()
         self.ensure_focus()
@@ -449,6 +458,7 @@ class VoiceSorter(QMainWindow):
     def update_status(self):
         total = len(self.files); pos = self.index + 1 if self.index >= 0 else 0
         enabled_cnt = sum(1 for _,e,d in self.store.list_inputs() if e and not d)
+        
         base = f"{pos}/{total} 件 | プロジェクト:{self.project_key} | 有効入力:{enabled_cnt}"
         base += " | 再帰:ON" if self.recursive else " | 再帰:OFF"
         if self.output_dir: base += f" | 出力:{self.output_dir}"
@@ -516,8 +526,10 @@ class VoiceSorter(QMainWindow):
     # ---------- inputs CRUD ----------
     def refresh_inputs_view(self):
         self.list_inputs.clear()
-        try: self.list_inputs.itemChanged.disconnect()
-        except Exception: pass
+        try: 
+            self.list_inputs.itemChanged.disconnect()
+        except (RuntimeError, TypeError): 
+            pass
 
         for path, enabled, done in self.store.list_inputs():
             it = QListWidgetItem(path)
@@ -561,7 +573,8 @@ class VoiceSorter(QMainWindow):
 
     @Slot(int)
     def set_recursive(self, state: int):
-        self.recursive = (state == Qt.Checked)
+        from PySide6.QtCore import Qt
+        self.recursive = (state == Qt.CheckState.Checked.value) or (state == 2)
         self.store.set_setting("recursive", "true" if self.recursive else "false")
         self.load_files(); self.ensure_focus()
 
@@ -602,11 +615,14 @@ class VoiceSorter(QMainWindow):
         files: List[Path] = []
 
         def add_from_dir(d: Path):
-            if not d.exists(): return
+            if not d.exists():
+                return
             if d.name in (EXCLUDE_DIR_NAME, DEFER_DIR_NAME): return
             if self.recursive:
                 for p in sorted(d.rglob("*")):
-                    if p.is_dir() and p.name in (EXCLUDE_DIR_NAME, DEFER_DIR_NAME): continue
+                    # 除外ディレクトリ内のファイルをスキップ
+                    if any(part in (EXCLUDE_DIR_NAME, DEFER_DIR_NAME) for part in p.parts):
+                        continue
                     if p.is_file() and p.suffix.lower() in AUDIO_EXTS: files.append(p)
             else:
                 for p in sorted(d.iterdir()):
@@ -657,6 +673,28 @@ class VoiceSorter(QMainWindow):
         return restored
 
     # ---------- playback ----------
+    def _format_time(self, ms: int) -> str:
+        total_seconds = ms / 1000.0
+        m = int(total_seconds // 60)
+        s = total_seconds % 60
+        return f"{m}:{s:05.2f}"
+
+    @Slot()
+    def update_playback_time(self):
+        if not self.player:
+            return
+        # ソースが空の場合は 0:00.00/0:00.00 にリセット
+        if self.player.source().isEmpty():
+            self.lbl_playback_time.setText("再生時間: 0:00.00 / 0:00.00")
+            return
+        pos = self.player.position()
+        dur = self.player.duration()
+        # デバッグ: 実際の値を確認
+        # print(f"[DEBUG] pos={pos}ms, dur={dur}ms")
+        pos_str = self._format_time(pos) if pos >= 0 else "0:00.00"
+        dur_str = self._format_time(dur) if dur > 0 else "0:00.00"
+        self.lbl_playback_time.setText(f"再生時間: {pos_str} / {dur_str}")
+
     @Slot()
     def toggle_play(self):
         if not self.player:
@@ -936,6 +974,8 @@ class VoiceSorter(QMainWindow):
                     self.player.setSource(QUrl())
             except Exception:
                 pass
+            # 明示的にリセット（シグナル発火を待たない）
+            self.lbl_playback_time.setText("再生時間: 0:00.00 / 0:00.00")
 
     # ---------- keyboard / autocomplete ----------
     def eventFilter(self, obj, event):
