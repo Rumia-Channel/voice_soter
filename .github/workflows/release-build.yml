@@ -80,17 +80,17 @@ jobs:
         run: |
           cd build
           if [ -d "main.dist" ]; then
-            mv main.dist VoiceSoter.dist
+            mv main.dist VoiceSoter
           fi
         shell: bash
 
-      # Windows: main.dist → VoiceSoter.dist
+      # Windows: main.dist → VoiceSoter
       - name: Rename dist dir (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd build
           if (Test-Path "main.dist") {
-            Rename-Item -Path "main.dist" -NewName "VoiceSoter.dist"
+            Rename-Item -Path "main.dist" -NewName "VoiceSoter"
           }
         shell: pwsh
 
@@ -102,21 +102,21 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           cd build
-          tar czf VoiceSoter-ubuntu-latest.tar.gz VoiceSoter.dist
+          tar czf VoiceSoter-ubuntu-latest.tar.gz VoiceSoter
 
       # macOSはzip
       - name: Archive artifact (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           cd build
-          zip -r VoiceSoter-macos-latest.zip VoiceSoter.dist
+          zip -r VoiceSoter-macos-latest.zip VoiceSoter
 
       # Windowsもzip
       - name: Archive artifact (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd build
-          powershell -Command "Compress-Archive -Path VoiceSoter.dist -DestinationPath VoiceSoter-windows-latest.zip -Force"
+          powershell -Command "Compress-Archive -Path VoiceSoter -DestinationPath VoiceSoter-windows-latest.zip -Force"
 
       # =========================
       # リリースが無かったら作る
