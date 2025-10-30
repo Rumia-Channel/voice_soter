@@ -55,6 +55,7 @@ uv run python main.py
 | Undo（取り消し） | `Ctrl + Z`                      | 直前の仕分けを元に戻す                                 |
 | Redo（やり直し） | `Ctrl + Shift + Z` / `Ctrl + Y` | 取り消しをやり直す                                   |
 | ロック解除＋削除   | `Backspace`（ロック時）               | 入力ロックを解除しつつ1文字削除                            |
+| 名前への空白の挿入 | `Ctrl + Space` | `Space` を押すと音声ファイルが再生されてしまうため、名前に空白を入れるには `Ctrl + Space` を押さねばならない。 |
 
 ---
 
