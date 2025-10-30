@@ -1,0 +1,76 @@
+name: build-and-upload-binaries
+
+on:
+  release:
+    types: [published, released, edited]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-on-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: tar.gz
+            ext: ""
+          - os: windows-latest
+            archive: zip
+            ext: ".exe"
+          - os: macos-latest
+            archive: zip
+            ext: ""
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v1
+
+      - name: Install Python with uv
+        run: uv python install 3.12
+
+      - name: Sync deps
+        run: uv sync
+
+      - name: Build with Nuitka
+        run: |
+          uv run python -m nuitka \
+            --standalone \
+            --output-dir=build \
+            --output-filename=VoiceSoter${{ matrix.ext }} \
+            --enable-plugin=pyside6 \
+            --include-qt-plugins=multimedia \
+            main.py
+
+      # ←ここで後からリネームする
+      - name: Rename dist dir
+        run: |
+          cd build
+          mv main.dist VoiceSoter.dist
+
+      - name: Archive artifact (Linux/mac)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cd build
+          tar czf VoiceSoter-${{ matrix.os }}.${{ matrix.archive }} VoiceSoter${{ matrix.ext }} VoiceSoter.dist
+
+      - name: Archive artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd build
+          powershell -Command "Compress-Archive -Path VoiceSoter${{ matrix.ext }},VoiceSoter.dist -DestinationPath VoiceSoter-${{ matrix.os }}.zip"
+
+      - name: Upload to release
+        run: |
+          cd build
+          FILE=VoiceSoter-${{ matrix.os }}.${{ matrix.archive }}
+          gh release upload "$RELEASE_TAG" "$FILE" --clobber
