@@ -23,8 +23,10 @@ jobs:
             archive: zip
 
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # gh CLIはこっちを見る。Windowsでもbashでも同じ名前にしておく。
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ github.event.release.tag_name }}
+      # Windowsで「depends落としていい？」って聞かせない
       NUITKA_ASSUME_YES_FOR_DOWNLOADS: "1"
 
     steps:
@@ -40,7 +42,9 @@ jobs:
       - name: Sync deps
         run: uv sync
 
-      # Linux / macOS ビルド
+      # =========================
+      # ビルド
+      # =========================
       - name: Build with Nuitka (Linux/mac)
         if: matrix.os != 'windows-latest'
         run: |
@@ -55,10 +59,22 @@ jobs:
       # Windows ビルド
       - name: Build with Nuitka (Windows)
         if: matrix.os == 'windows-latest'
-        run: uv run python -m nuitka --standalone --output-dir=build --output-filename=VoiceSoter.exe --enable-plugin=pyside6 --include-qt-plugins=multimedia --assume-yes-for-downloads main.py
+        # pwshで1行にするとトラブルが減る
+        run: >
+          uv run python -m nuitka
+          --standalone
+          --output-dir=build
+          --output-filename=VoiceSoter.exe
+          --enable-plugin=pyside6
+          --include-qt-plugins=multimedia
+          --assume-yes-for-downloads
+          main.py
         shell: pwsh
 
-      # Linux/mac: main.dist → VoiceSoter.dist
+      # =========================
+      # dist名そろえ
+      # =========================
+
       - name: Rename dist dir (Linux/mac)
         if: matrix.os != 'windows-latest'
         run: |
@@ -78,7 +94,10 @@ jobs:
           }
         shell: pwsh
 
-      # Linuxだけtar.gz
+      # =========================
+      # アーカイブ作成
+      # =========================
+
       - name: Archive artifact (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -99,7 +118,32 @@ jobs:
           cd build
           powershell -Command "Compress-Archive -Path VoiceSoter.dist -DestinationPath VoiceSoter-windows-latest.zip -Force"
 
+      # =========================
+      # リリースが無かったら作る
+      # =========================
+
+      - name: Ensure release exists (Linux/mac)
+        if: matrix.os != 'windows-latest'
+        run: |
+          # あったら何もしない。なかったら空で作る。
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes ""
+        shell: bash
+
+      - name: Ensure release exists (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --notes ""
+          }
+
+      # =========================
       # アップロード
+      # =========================
+
       - name: Upload to release (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -114,6 +158,8 @@ jobs:
 
       - name: Upload to release (Windows)
         if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
           cd build
-          gh release upload "$RELEASE_TAG" "VoiceSoter-windows-latest.zip" --clobber
+          $tag = "${{ github.event.release.tag_name }}"
+          gh release upload $tag "VoiceSoter-windows-latest.zip" --clobber
