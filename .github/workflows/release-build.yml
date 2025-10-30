@@ -17,13 +17,11 @@ jobs:
         include:
           - os: ubuntu-latest
             archive: tar.gz
-            ext: ""
+          - os: macos-latest
+            archive: tar.gz
           - os: windows-latest
             archive: zip
-            ext: ".exe"
-          - os: macos-latest
-            archive: zip
-            ext: ""
+
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -41,36 +39,69 @@ jobs:
       - name: Sync deps
         run: uv sync
 
-      - name: Build with Nuitka
+      # Linux/mac用ビルド
+      - name: Build with Nuitka (Linux/mac)
+        if: matrix.os != 'windows-latest'
         run: |
           uv run python -m nuitka \
             --standalone \
             --output-dir=build \
-            --output-filename=VoiceSoter${{ matrix.ext }} \
+            --output-filename=VoiceSoter \
             --enable-plugin=pyside6 \
             --include-qt-plugins=multimedia \
             main.py
 
-      # ←ここで後からリネームする
+      # Windows用ビルド (PowerShellは行継続が違う)
+      - name: Build with Nuitka (Windows)
+        if: matrix.os == 'windows-latest'
+        run: uv run python -m nuitka --standalone --output-dir=build --output-filename=VoiceSoter.exe --enable-plugin=pyside6 --include-qt-plugins=multimedia main.py
+        shell: pwsh
+
+      # ここで main.dist を VoiceSoter.dist にそろえる。全OS共通。
       - name: Rename dist dir
         run: |
           cd build
-          mv main.dist VoiceSoter.dist
+          if [ -d "main.dist" ]; then
+            mv main.dist VoiceSoter.dist
+          fi
+        shell: bash
 
-      - name: Archive artifact (Linux/mac)
-        if: matrix.os != 'windows-latest'
+      # Linux: distだけ固める
+      - name: Archive artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           cd build
-          tar czf VoiceSoter-${{ matrix.os }}.${{ matrix.archive }} VoiceSoter${{ matrix.ext }} VoiceSoter.dist
+          tar czf VoiceSoter-ubuntu-latest.tar.gz VoiceSoter.dist
 
+      # macOS: distだけ固める (.appごと入れたいならここでVoiceSoter.appも足す)
+      - name: Archive artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd build
+          tar czf VoiceSoter-macos-latest.tar.gz VoiceSoter.dist
+
+      # Windows: distだけzip
       - name: Archive artifact (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd build
-          powershell -Command "Compress-Archive -Path VoiceSoter${{ matrix.ext }},VoiceSoter.dist -DestinationPath VoiceSoter-${{ matrix.os }}.zip"
+          powershell -Command "Compress-Archive -Path VoiceSoter.dist -DestinationPath VoiceSoter-windows-latest.zip -Force"
 
-      - name: Upload to release
+      # アップロード (OSごとにファイル名が違うので分ける)
+      - name: Upload to release (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           cd build
-          FILE=VoiceSoter-${{ matrix.os }}.${{ matrix.archive }}
-          gh release upload "$RELEASE_TAG" "$FILE" --clobber
+          gh release upload "$RELEASE_TAG" "VoiceSoter-ubuntu-latest.tar.gz" --clobber
+
+      - name: Upload to release (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd build
+          gh release upload "$RELEASE_TAG" "VoiceSoter-macos-latest.tar.gz" --clobber
+
+      - name: Upload to release (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd build
+          gh release upload "$RELEASE_TAG" "VoiceSoter-windows-latest.zip" --clobber
