@@ -8,3 +8,6 @@ dependencies = [
     "nuitka>=2.7.16",
     "pyside6>=6.9.3",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
